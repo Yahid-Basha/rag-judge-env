@@ -1,6 +1,9 @@
 import random
 from typing import Optional
 
+from openenv.core.env_server.interfaces import Environment
+from openenv.core.env_server.types import State
+
 try:
     from ..models import RAGAction, RAGObservation, RAGReward, TaskType
 except ImportError:
@@ -11,19 +14,21 @@ try:
 except ImportError:
     from dataset import TASKS
 
-class RagJudgeEnvEnvironment:
+
+class RagJudgeEnvEnvironment(Environment):
     def __init__(self):
-        self.current_task = None
+        super().__init__()
         self.current_task_type = None
         self.current_data = None
         self.done = False
         self.steps = 0
         self.max_steps = 8
 
-    def reset(self, task_type: Optional[str] = None) -> RAGObservation:
+    def reset(self, seed: Optional[int] = None, episode_id: Optional[str] = None, **kwargs) -> RAGObservation:
         self.done = False
         self.steps = 0
 
+        task_type = kwargs.get("task_type", None)
         if task_type is None:
             task_type = random.choice(["relevance", "hallucination", "full_judgment"])
 
@@ -34,21 +39,26 @@ class RagJudgeEnvEnvironment:
 
         return self._build_observation()
 
-    def step(self, action: RAGAction) -> tuple[RAGObservation, RAGReward, bool, dict]:
+    def step(self, action: RAGAction, timeout_s: Optional[float] = None, **kwargs) -> RAGObservation:
         self.steps += 1
-        reward = self._grade(action)
-        self.done = True  # single-turn eval tasks
+        reward_obj = self._grade(action)
+        self.done = True
 
         obs = self._build_observation()
-        return obs, reward, self.done, {"steps": self.steps}
+        obs.reward = reward_obj.score
+        obs.done = self.done
+        # stash full reward for callers that need feedback/partial_scores
+        obs.metadata["feedback"] = reward_obj.feedback
+        if reward_obj.partial_scores:
+            obs.metadata["partial_scores"] = reward_obj.partial_scores
+        return obs
 
-    def state(self):
-        return {
-            "task_type": self.current_task_type,
-            "steps": self.steps,
-            "done": self.done,
-            "current_data": self.current_data
-        }
+    @property
+    def state(self) -> State:
+        return State(
+            episode_id=None,
+            step_count=self.steps,
+        )
 
     def _build_observation(self) -> RAGObservation:
         d = self.current_data
@@ -109,7 +119,6 @@ class RagJudgeEnvEnvironment:
                 if any(gt in p or p in gt for p in predicted)
             )
             score = matched / len(ground_truth) if ground_truth else 1.0
-            # penalize over-flagging
             over_flag_penalty = max(0, len(predicted) - len(ground_truth)) * 0.1
             score = max(0.0, round(score - over_flag_penalty, 2))
             return RAGReward(

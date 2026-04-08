@@ -110,8 +110,9 @@ def run_task(task_type: str) -> float:
                 action = RAGAction(reasoning=f"parse error: {e}")
                 action_json = json.dumps({"reasoning": str(e)[:80]})
 
-            obs, reward_obj, done, info = env.step(action)
-            reward = reward_obj.score
+            obs = env.step(action)
+            reward = obs.reward or 0.0
+            done = obs.done
             rewards.append(reward)
             steps_taken = step
 

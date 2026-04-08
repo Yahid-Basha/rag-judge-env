@@ -2,21 +2,26 @@ from pydantic import BaseModel
 from typing import Optional, List
 from enum import Enum
 
+from openenv.core.env_server.types import Action, Observation
+
+
 class TaskType(str, Enum):
     RELEVANCE = "relevance"
     HALLUCINATION = "hallucination"
     FULL_JUDGMENT = "full_judgment"
 
-class RAGAction(BaseModel):
-    # Agent's judgment output
-    relevant_chunk_ids: Optional[List[int]] = None      # for relevance task
-    hallucinated_claims: Optional[List[str]] = None     # for hallucination task
-    relevance_score: Optional[float] = None             # for full judgment
-    faithfulness_score: Optional[float] = None          # for full judgment
-    citation_accuracy_score: Optional[float] = None     # for full judgment
+
+class RAGAction(Action):
+    relevant_chunk_ids: Optional[List[int]] = None
+    hallucinated_claims: Optional[List[str]] = None
+    relevance_score: Optional[float] = None
+    faithfulness_score: Optional[float] = None
+    citation_accuracy_score: Optional[float] = None
     reasoning: Optional[str] = None
 
-class RAGObservation(BaseModel):
+
+class RAGObservation(Observation):
+    # Observation base already provides: done=False, reward=None, metadata={}
     query: str
     retrieved_chunks: List[str]
     chunk_ids: List[int]
@@ -25,7 +30,8 @@ class RAGObservation(BaseModel):
     task_type: TaskType
     instructions: str
 
+
 class RAGReward(BaseModel):
-    score: float          # 0.0 - 1.0
+    score: float
     feedback: str
     partial_scores: Optional[dict] = None
