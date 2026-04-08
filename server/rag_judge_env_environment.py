@@ -1,5 +1,5 @@
 import random
-from typing import Optional
+from typing import Optional, List
 
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
@@ -14,41 +14,71 @@ try:
 except ImportError:
     from dataset import TASKS
 
+# Number of evaluation questions per episode.
+# Each step presents one question from a rotating task type.
+QUESTIONS_PER_EPISODE = 3
+
 
 class RagJudgeEnvEnvironment(Environment):
+    """
+    Multi-step RAG pipeline evaluation environment.
+
+    Each episode runs QUESTIONS_PER_EPISODE questions cycling through
+    relevance → hallucination → full_judgment (randomly ordered).
+    The agent receives a new question after each step; done=True only
+    after the final question is answered.
+    """
+
     def __init__(self):
         super().__init__()
-        self.current_task_type = None
-        self.current_data = None
-        self.done = False
         self.steps = 0
         self.max_steps = 8
+        self._episode_tasks: List[str] = []   # task types queued for this episode
+        self._episode_data: List[dict] = []   # dataset samples queued for this episode
+        self._step_rewards: List[float] = []  # reward at each step
+        self.current_task_type: Optional[TaskType] = None
+        self.current_data: Optional[dict] = None
+        self.done: bool = False
+
+    # ------------------------------------------------------------------
+    # OpenEnv interface
+    # ------------------------------------------------------------------
 
     def reset(self, seed: Optional[int] = None, episode_id: Optional[str] = None, **kwargs) -> RAGObservation:
-        self.done = False
+        if seed is not None:
+            random.seed(seed)
+
         self.steps = 0
+        self.done = False
+        self._step_rewards = []
 
-        task_type = kwargs.get("task_type", None)
-        if task_type is None:
-            task_type = random.choice(["relevance", "hallucination", "full_judgment"])
+        # Build the episode queue: one sample per task type, in random order
+        task_types = ["relevance", "hallucination", "full_judgment"]
+        random.shuffle(task_types)
+        self._episode_tasks = task_types[:QUESTIONS_PER_EPISODE]
+        self._episode_data = [self._sample_task(t) for t in self._episode_tasks]
 
-        self.current_task_type = TaskType(task_type)
-        pool = TASKS[task_type]
-        weights = [s.get("weight", 1) for s in pool]
-        self.current_data = random.choices(pool, weights=weights, k=1)[0]
-
+        # Load the first question
+        self._load_step(0)
         return self._build_observation()
 
     def step(self, action: RAGAction, timeout_s: Optional[float] = None, **kwargs) -> RAGObservation:
-        self.steps += 1
         reward_obj = self._grade(action)
-        self.done = True
+        self._step_rewards.append(reward_obj.score)
+        self.steps += 1
+
+        # Advance to next question, or end episode
+        if self.steps >= len(self._episode_tasks):
+            self.done = True
+        else:
+            self._load_step(self.steps)
 
         obs = self._build_observation()
         obs.reward = reward_obj.score
         obs.done = self.done
-        # stash full reward for callers that need feedback/partial_scores
         obs.metadata["feedback"] = reward_obj.feedback
+        obs.metadata["step_rewards"] = list(self._step_rewards)
+        obs.metadata["steps_remaining"] = max(0, len(self._episode_tasks) - self.steps)
         if reward_obj.partial_scores:
             obs.metadata["partial_scores"] = reward_obj.partial_scores
         return obs
@@ -60,15 +90,35 @@ class RagJudgeEnvEnvironment(Environment):
             step_count=self.steps,
         )
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _sample_task(self, task_type: str) -> dict:
+        pool = TASKS[task_type]
+        weights = [s.get("weight", 1) for s in pool]
+        return random.choices(pool, weights=weights, k=1)[0]
+
+    def _load_step(self, idx: int) -> None:
+        self.current_task_type = TaskType(self._episode_tasks[idx])
+        self.current_data = self._episode_data[idx]
+
     def _build_observation(self) -> RAGObservation:
         d = self.current_data
+        step_num = self.steps + 1  # 1-indexed for display
+        total = len(self._episode_tasks)
+        progress = f" [Question {step_num}/{total}]"
+
         if self.current_task_type == TaskType.RELEVANCE:
             return RAGObservation(
                 query=d["query"],
                 retrieved_chunks=d["chunks"],
                 chunk_ids=list(range(len(d["chunks"]))),
                 task_type=self.current_task_type,
-                instructions="Identify which chunk IDs are relevant to the query. Set relevant_chunk_ids in your action."
+                instructions=(
+                    "Identify which chunk IDs are relevant to the query. "
+                    "Set relevant_chunk_ids in your action." + progress
+                )
             )
         elif self.current_task_type == TaskType.HALLUCINATION:
             return RAGObservation(
@@ -77,7 +127,10 @@ class RagJudgeEnvEnvironment(Environment):
                 chunk_ids=[0],
                 generated_answer=d["answer"],
                 task_type=self.current_task_type,
-                instructions="Identify hallucinated claims in the answer not supported by context. Set hallucinated_claims in your action."
+                instructions=(
+                    "Identify hallucinated claims in the answer not supported by context. "
+                    "Set hallucinated_claims in your action." + progress
+                )
             )
         else:
             return RAGObservation(
@@ -87,7 +140,9 @@ class RagJudgeEnvEnvironment(Environment):
                 generated_answer=d["answer"],
                 cited_sources=d["cited_ids"],
                 task_type=self.current_task_type,
-                instructions="Score relevance, faithfulness, and citation accuracy between 0.0 and 1.0."
+                instructions=(
+                    "Score relevance, faithfulness, and citation accuracy between 0.0 and 1.0." + progress
+                )
             )
 
     def _grade(self, action: RAGAction) -> RAGReward:

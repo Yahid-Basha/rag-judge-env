@@ -33,6 +33,8 @@ SUCCESS_SCORE_THRESHOLD = 0.5
 
 client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
 
+# Each episode covers all 3 task types in a single multi-step run.
+# We run one episode per entry so the hackathon evaluator sees 3 START/END blocks.
 TASK_TYPES = ["relevance", "hallucination", "full_judgment"]
 
 
@@ -121,7 +123,7 @@ def run_task(task_type: str) -> float:
             if done:
                 break
 
-        score = rewards[-1] if rewards else 0.0
+        score = round(sum(rewards) / len(rewards), 2) if rewards else 0.0
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     finally:
