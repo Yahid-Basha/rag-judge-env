@@ -1,6 +1,7 @@
 import os
 import json
 import re
+from typing import List, Optional
 from openai import OpenAI
 
 try:
@@ -19,10 +20,16 @@ try:
 except ImportError:
     from rag_judge_env.models import RAGAction, TaskType
 
+# --- mandatory variables (per submission spec) ---
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+HF_TOKEN = os.getenv("HF_TOKEN")
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")  # optional: only used with from_docker_image()
+
 BENCHMARK = "rag_judge_env"
+MAX_STEPS = 8
+SUCCESS_SCORE_THRESHOLD = 0.5
 
 client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
 
@@ -30,9 +37,7 @@ TASK_TYPES = ["relevance", "hallucination", "full_judgment"]
 
 
 def extract_json(text: str) -> str:
-    """Strip markdown code fences if present and return raw JSON string."""
     text = text.strip()
-    # Remove ```json ... ``` or ``` ... ``` fences
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
         return match.group(1).strip()
@@ -57,39 +62,71 @@ Retrieved Chunks:
     return base
 
 
-def run_task(task_type: str):
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={error_val}", flush=True)
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
+
+
+def run_task(task_type: str) -> float:
     env = RagJudgeEnvEnvironment()
     obs = env.reset(task_type=task_type)
 
-    print(f"[START] task={task_type} env={BENCHMARK} model={MODEL_NAME}")
+    log_start(task=task_type, env=BENCHMARK, model=MODEL_NAME)
 
-    prompt = build_prompt(obs)
-    error_msg = "null"
-    action_json = "{}"
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
 
     try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=500
-        )
-        raw = response.choices[0].message.content.strip()
-        clean = extract_json(raw)
-        data = json.loads(clean)
-        action = RAGAction(**data)
-        action_json = json.dumps(data)
-    except Exception as e:
-        error_msg = str(e).replace("\n", " ")[:120]
-        action = RAGAction(reasoning=f"parse error: {e}")
-        action_json = json.dumps({"reasoning": f"parse error: {e}"[:80]})
+        for step in range(1, MAX_STEPS + 1):
+            error_msg: Optional[str] = None
+            action_json = "{}"
 
-    obs_next, reward, done, info = env.step(action)
+            try:
+                prompt = build_prompt(obs)
+                response = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_tokens=500
+                )
+                raw = response.choices[0].message.content.strip()
+                clean = extract_json(raw)
+                data = json.loads(clean)
+                action = RAGAction(**data)
+                action_json = json.dumps(data)
+            except Exception as e:
+                error_msg = str(e).replace("\n", " ")[:120]
+                action = RAGAction(reasoning=f"parse error: {e}")
+                action_json = json.dumps({"reasoning": str(e)[:80]})
 
-    print(f"[STEP] step=1 action={action_json} reward={reward.score:.2f} done={str(done).lower()} error={error_msg}")
-    print(f"[END] success={str(reward.score > 0.5).lower()} steps=1 score={reward.score:.2f} rewards={reward.score:.2f}")
+            obs, reward_obj, done, info = env.step(action)
+            reward = reward_obj.score
+            rewards.append(reward)
+            steps_taken = step
 
-    return reward.score
+            log_step(step=step, action=action_json, reward=reward, done=done, error=error_msg)
+
+            if done:
+                break
+
+        score = rewards[-1] if rewards else 0.0
+        success = score >= SUCCESS_SCORE_THRESHOLD
+
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+    return score
 
 
 if __name__ == "__main__":
